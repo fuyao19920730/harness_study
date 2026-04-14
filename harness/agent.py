@@ -9,6 +9,9 @@ from typing import Any
 from harness.config import build_agent_config, resolve_api_key
 from harness.llm.base import BaseLLM
 from harness.llm.openai import OpenAILLM
+from harness.memory.short_term import ShortTermMemory
+from harness.memory.working import WorkingMemory
+from harness.planner.react import ReActPlanner
 from harness.schema.config import AgentConfig, LLMConfig, MemoryConfig, SafetyConfig
 from harness.schema.message import Message, Role, ToolResult
 from harness.schema.trace import StepType, Trace, TraceStep
@@ -71,6 +74,11 @@ class Agent:
                 self._tool_registry.register(t)
 
         self._llm = llm or self._build_llm(self._config.llm)
+        self._planner = ReActPlanner(max_iterations=self._config.safety.max_steps)
+        self._memory = ShortTermMemory(
+            max_messages=self._config.memory.short_term_max_messages
+        )
+        self._working = WorkingMemory()
 
     @property
     def name(self) -> str:
@@ -78,12 +86,27 @@ class Agent:
 
     async def run(self, goal: str) -> AgentResult:
         """Execute the agent loop for a given goal and return the result."""
+        self._planner.reset()
+        self._working.clear()
+
         trace = Trace(agent_name=self.name, goal=goal)
-        messages = self._build_initial_messages(goal)
+        system_prompt = self._config.system_prompt or self._default_system_prompt()
+
+        if self._tool_registry.list_names():
+            system_prompt = self._planner.build_system_prompt(
+                system_prompt, self._tool_registry.list_names()
+            )
+
+        system_msg = Message.system(system_prompt)
+        user_msg = Message.user(goal)
+        await self._memory.add(system_msg)
+        await self._memory.add(user_msg)
 
         tool_schemas = self._tool_registry.list_schemas() or None
 
-        for step_num in range(self._config.safety.max_steps):
+        for _ in range(self._config.safety.max_steps):
+            messages = await self._memory.get_context()
+
             t0 = time.time()
             response = await self._llm.chat(messages, tools=tool_schemas)
             latency_ms = (time.time() - t0) * 1000
@@ -91,26 +114,36 @@ class Agent:
             trace.add_step(TraceStep(
                 type=StepType.LLM_CALL,
                 model=response.model,
-                prompt_tokens=response.usage.prompt_tokens if response.usage else None,
-                completion_tokens=response.usage.completion_tokens if response.usage else None,
+                prompt_tokens=(
+                    response.usage.prompt_tokens if response.usage else None
+                ),
+                completion_tokens=(
+                    response.usage.completion_tokens if response.usage else None
+                ),
                 latency_ms=latency_ms,
             ))
 
             assistant_msg = response.message
-            messages.append(assistant_msg)
+            await self._memory.add(assistant_msg)
 
             if not assistant_msg.tool_calls:
                 output = assistant_msg.content or ""
                 trace.finish(output=output)
-                return AgentResult(output=output, trace=trace, messages=messages)
+                return AgentResult(
+                    output=output,
+                    trace=trace,
+                    messages=await self._memory.get_context(),
+                )
 
-            messages, trace = await self._execute_tool_calls(
-                assistant_msg, messages, trace
-            )
+            await self._execute_tool_calls(assistant_msg, trace)
 
-        output = self._extract_last_content(messages)
+        output = await self._extract_last_content()
         trace.finish(output=output, error="max_steps_reached")
-        return AgentResult(output=output, trace=trace, messages=messages)
+        return AgentResult(
+            output=output,
+            trace=trace,
+            messages=await self._memory.get_context(),
+        )
 
     async def chat(self, message: str) -> str:
         """Simple single-turn chat — convenience wrapper around run()."""
@@ -127,44 +160,36 @@ class Agent:
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
 
-    def _build_initial_messages(self, goal: str) -> list[Message]:
-        messages: list[Message] = []
-        system_prompt = self._config.system_prompt or self._default_system_prompt()
-        messages.append(Message.system(system_prompt))
-        messages.append(Message.user(goal))
-        return messages
-
     def _default_system_prompt(self) -> str:
-        parts = [f"You are {self._config.name}."]
+        parts = [f"你是 {self._config.name}。"]
         if self._config.description:
             parts.append(self._config.description)
         if self._tool_registry:
             tool_names = ", ".join(self._tool_registry.list_names())
             if tool_names:
-                parts.append(f"You have access to the following tools: {tool_names}.")
-                parts.append("Use tools when they help accomplish the user's goal.")
-        parts.append("Be concise, accurate, and helpful.")
+                parts.append(f"你可以使用以下工具: {tool_names}。")
+                parts.append("在需要时使用工具来帮助完成用户的任务。")
+        parts.append("请简洁、准确、有帮助地回答。")
         return " ".join(parts)
 
     async def _execute_tool_calls(
         self,
         assistant_msg: Message,
-        messages: list[Message],
         trace: Trace,
-    ) -> tuple[list[Message], Trace]:
+    ) -> None:
         for tc in assistant_msg.tool_calls or []:
             t0 = time.time()
             tool_obj = self._tool_registry.get(tc.name)
 
             if tool_obj is None:
-                result_content = f"Error: unknown tool '{tc.name}'"
+                result_content = f"Error: 未知工具 '{tc.name}'"
                 is_error = True
             else:
                 try:
                     result_content = await tool_obj.execute(**tc.arguments)
                     is_error = False
                 except Exception as e:
-                    logger.exception("Tool %s failed", tc.name)
+                    logger.exception("工具 %s 执行失败", tc.name)
                     result_content = f"Error: {type(e).__name__}: {e}"
                     is_error = True
 
@@ -184,12 +209,10 @@ class Agent:
                 content=result_content,
                 is_error=is_error,
             )
-            messages.append(Message.tool(tool_result))
+            await self._memory.add(Message.tool(tool_result))
 
-        return messages, trace
-
-    @staticmethod
-    def _extract_last_content(messages: list[Message]) -> str:
+    async def _extract_last_content(self) -> str:
+        messages = await self._memory.get_context()
         for msg in reversed(messages):
             if msg.role == Role.ASSISTANT and msg.content:
                 return msg.content
@@ -211,6 +234,6 @@ class Agent:
             )
 
         raise ValueError(
-            f"Unsupported LLM provider: '{provider}'. "
-            f"Supported: openai, deepseek. (anthropic coming in Phase 4)"
+            f"不支持的 LLM provider: '{provider}'。"
+            f"目前支持: openai, deepseek。(anthropic 将在 Phase 4 添加)"
         )
