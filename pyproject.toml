@@ -1,0 +1,46 @@
+[project]
+name = "agent-harness"
+version = "0.1.0"
+description = "Production-grade Agent Harness framework — the OS layer that turns LLMs into autonomous agents."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "harness-dev" }]
+
+dependencies = [
+    "pydantic>=2.7,<3",
+    "httpx>=0.27,<1",
+    "openai>=1.30,<2",
+    "structlog>=24.1,<25",
+    "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.30,<1"]
+all = [
+    "anthropic>=0.30,<1",
+    "chromadb>=0.5,<1",
+]
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-asyncio>=0.23,<1",
+    "ruff>=0.5,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["harness"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
