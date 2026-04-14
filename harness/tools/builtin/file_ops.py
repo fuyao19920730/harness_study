@@ -1,4 +1,15 @@
-"""Built-in tools: file read and write operations."""
+"""内置工具：文件操作（读、写、列目录）。
+
+提供三个工具：
+- read_file: 读取文件内容
+- write_file: 写入文件
+- list_dir: 列出目录内容
+
+所有工具都有防护措施：
+- 读取时自动截断过大的文件
+- 路径支持 ~ 展开（如 ~/Documents）
+- 错误不会抛异常，而是返回友好的错误提示
+"""
 
 from __future__ import annotations
 
@@ -9,7 +20,7 @@ from harness.tools.base import tool
 
 logger = logging.getLogger(__name__)
 
-_MAX_READ_SIZE = 50_000  # chars
+_MAX_READ_SIZE = 50_000  # 最大读取字符数，超出自动截断
 
 
 @tool(
@@ -17,9 +28,9 @@ _MAX_READ_SIZE = 50_000  # chars
     name="read_file",
 )
 async def read_file(path: str) -> str:
-    """Read and return the contents of a file."""
+    """读取文件内容并返回。"""
     try:
-        p = Path(path).expanduser().resolve()
+        p = Path(path).expanduser().resolve()  # 展开 ~ 并解析为绝对路径
         if not p.exists():
             return f"Error: 文件不存在: {path}"
         if not p.is_file():
@@ -39,10 +50,10 @@ async def read_file(path: str) -> str:
     name="write_file",
 )
 async def write_file(path: str, content: str) -> str:
-    """Write content to a file."""
+    """写入文件，自动创建父目录。"""
     try:
         p = Path(path).expanduser().resolve()
-        p.parent.mkdir(parents=True, exist_ok=True)
+        p.parent.mkdir(parents=True, exist_ok=True)  # 确保父目录存在
         p.write_text(content, encoding="utf-8")
         return f"OK: 已写入 {len(content)} 字符到 {p}"
 
@@ -55,7 +66,7 @@ async def write_file(path: str, content: str) -> str:
     name="list_dir",
 )
 async def list_dir(path: str = ".") -> str:
-    """List contents of a directory."""
+    """列出目录内容，目录名后加 / 后缀以区分。"""
     try:
         p = Path(path).expanduser().resolve()
         if not p.exists():

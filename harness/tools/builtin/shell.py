@@ -1,4 +1,8 @@
-"""Built-in tool: execute shell commands in a subprocess."""
+"""内置工具：Shell 命令执行。
+
+在子进程中执行 shell 命令，返回 stdout + stderr。
+支持超时控制，防止命令挂住导致 Agent 卡死。
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ from harness.tools.base import tool
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 30
+_DEFAULT_TIMEOUT = 30  # 默认超时 30 秒
 
 
 @tool(
@@ -21,17 +25,20 @@ _DEFAULT_TIMEOUT = 30
     name="shell",
 )
 async def shell(command: str, timeout: int = _DEFAULT_TIMEOUT) -> str:
-    """Execute a shell command and return stdout + stderr."""
+    """执行 shell 命令，返回输出结果。"""
     try:
+        # 创建子进程执行命令
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        # 等待完成，超时则抛出 TimeoutError
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
 
+        # 组装输出
         output_parts: list[str] = []
         if stdout:
             output_parts.append(stdout.decode(errors="replace"))
