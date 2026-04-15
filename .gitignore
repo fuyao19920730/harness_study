@@ -30,3 +30,6 @@ Thumbs.db
 # pytest / ruff 缓存
 .pytest_cache/
 .ruff_cache/
+
+# 编码助手本地配置（信任命令列表等）
+.coding_assistant.json

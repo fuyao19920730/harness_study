@@ -25,6 +25,7 @@ Phase 3 新增：
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -103,6 +104,14 @@ class Agent:
         output_guard: OutputGuard | None = None,
         tool_guard: ToolGuard | None = None,
         budget_guard: BudgetGuard | None = None,
+        # 工具确认回调：接收 (tool_name, arguments) 返回 True=允许 / False=拒绝
+        confirm_callback: Callable[[str, dict[str, Any]], bool] | None = None,
+        # 步骤回调：每当 Agent 完成一个动作时调用，用于实时展示进度
+        # 接收 (event_type, data_dict)，event_type 可以是:
+        #   "thinking" — LLM 返回了文本思考（data: content）
+        #   "tool_call" — LLM 决定调用工具（data: name, arguments）
+        #   "tool_result" — 工具返回了结果（data: name, content, is_error）
+        step_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         # ── 构建配置 ──
         if config:
@@ -157,6 +166,10 @@ class Agent:
         )
         self._budget_guard = budget_guard or self._build_budget_guard()
 
+        # ── 回调 ──
+        self._confirm_callback = confirm_callback
+        self._step_callback = step_callback
+
         # ── Trace 导出（Phase 3） ──
         self._trace_exporter: TraceExporter | None = (
             TraceExporter(output_dir=trace_dir) if trace_dir else None
@@ -168,16 +181,21 @@ class Agent:
 
     # ── 核心执行循环 ──────────────────────────────────────────
 
-    async def run(self, goal: str) -> AgentResult:
+    async def run(self, goal: str, *, keep_history: bool = False) -> AgentResult:
         """执行 Agent 循环，完成用户给定的目标。
 
         这是框架最核心的方法，整个"推理→行动→观察"循环在这里驱动。
         Phase 3 在循环中增加了护栏检查点。
+
+        Args:
+            goal: 用户的目标/指令
+            keep_history: 为 True 时保留之前的消息历史（多轮对话模式），
+                          为 False 时每次重置（单次任务模式，默认行为）。
         """
         log = logger.bind(agent=self.name, goal=goal[:80])
         log.info("agent.run.start")
 
-        # 重置状态
+        # 重置每轮都要重置的状态
         self._planner.reset()
         self._working.clear()
         self._budget_guard.reset()
@@ -200,18 +218,23 @@ class Agent:
                 messages=[],
             )
 
-        # 构建 system prompt
-        system_prompt = (
-            self._config.system_prompt or self._default_system_prompt()
-        )
-        if self._tool_registry.list_names():
-            system_prompt = self._planner.build_system_prompt(
-                system_prompt, self._tool_registry.list_names()
-            )
+        if keep_history and self._memory.count() > 0:
+            # 多轮对话：只追加新的用户消息，保留之前的上下文
+            await self._memory.add(Message.user(goal))
+        else:
+            # 单次任务（默认）：清空历史，重新构建
+            await self._memory.clear()
 
-        # 初始化消息
-        await self._memory.add(Message.system(system_prompt))
-        await self._memory.add(Message.user(goal))
+            system_prompt = (
+                self._config.system_prompt or self._default_system_prompt()
+            )
+            if self._tool_registry.list_names():
+                system_prompt = self._planner.build_system_prompt(
+                    system_prompt, self._tool_registry.list_names()
+                )
+
+            await self._memory.add(Message.system(system_prompt))
+            await self._memory.add(Message.user(goal))
 
         tool_schemas = self._tool_registry.list_schemas() or None
 
@@ -265,6 +288,10 @@ class Agent:
             assistant_msg = response.message
             await self._memory.add(assistant_msg)
 
+            # 如果 LLM 返回了思考文本（同时有工具调用），通知上层
+            if assistant_msg.content and assistant_msg.tool_calls:
+                self._notify("thinking", {"content": assistant_msg.content})
+
             # 判断：工具调用 or 最终回答？
             if not assistant_msg.tool_calls:
                 output = assistant_msg.content or ""
@@ -312,10 +339,15 @@ class Agent:
 
     # ── 便捷方法 ──────────────────────────────────────────────
 
-    async def chat(self, message: str) -> str:
-        """简单的单轮对话（run() 的快捷方式）。"""
-        result = await self.run(message)
+    async def chat(self, message: str, *, keep_history: bool = True) -> str:
+        """对话方法，默认保留历史上下文（多轮对话）。"""
+        result = await self.run(message, keep_history=keep_history)
         return result.output
+
+    async def reset_conversation(self) -> None:
+        """清空对话历史，开始新的会话。"""
+        await self._memory.clear()
+        self._working.clear()
 
     async def close(self) -> None:
         """释放资源（HTTP 连接池等）。"""
@@ -355,6 +387,9 @@ class Agent:
         for tc in assistant_msg.tool_calls or []:
             # 工具权限检查
             tool_check = self._tool_guard.check(tc.name)
+            result_content: str = ""
+            is_error = False
+
             if tool_check.blocked:
                 log.warning("agent.tool.blocked", tool=tc.name, reason=tool_check.reason)
                 trace.add_step(TraceStep(
@@ -365,15 +400,27 @@ class Agent:
                 ))
                 result_content = f"Error: 工具 '{tc.name}' 被安全护栏拦截: {tool_check.reason}"
                 is_error = True
+
             elif tool_check.decision == GuardDecision.REQUIRE_CONFIRMATION:
                 log.info("agent.tool.needs_confirmation", tool=tc.name)
-                result_content = (
-                    f"Error: 工具 '{tc.name}' 需要人工确认才能执行。"
-                    f"当前自动模式下无法执行。"
+                confirmed = (
+                    self._confirm_callback is not None
+                    and self._confirm_callback(tc.name, tc.arguments)
                 )
-                is_error = True
-            else:
-                # 正常执行
+                if not confirmed:
+                    result_content = (
+                        f"Error: 工具 '{tc.name}' 需要人工确认才能执行。"
+                        f"当前自动模式下无法执行，或用户拒绝了执行。"
+                    )
+                    is_error = True
+
+            # 正常执行（ALLOW 或确认通过）
+            if not is_error:
+                self._notify("tool_call", {
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })
+
                 t0 = time.time()
                 tool_obj = self._tool_registry.get(tc.name)
 
@@ -383,7 +430,6 @@ class Agent:
                 else:
                     try:
                         result_content = await tool_obj.execute(**tc.arguments)
-                        is_error = False
                     except Exception as e:
                         log.exception("agent.tool.error", tool=tc.name)
                         result_content = f"Error: {type(e).__name__}: {e}"
@@ -403,6 +449,12 @@ class Agent:
             # 记录工具调用到 budget
             self._budget_guard.record_tool_call()
 
+            self._notify("tool_result", {
+                "name": tc.name,
+                "content": result_content,
+                "is_error": is_error,
+            })
+
             tool_result = ToolResult(
                 tool_call_id=tc.id,
                 name=tc.name,
@@ -410,6 +462,14 @@ class Agent:
                 is_error=is_error,
             )
             await self._memory.add(Message.tool(tool_result))
+
+    def _notify(self, event_type: str, data: dict[str, Any]) -> None:
+        """触发步骤回调（如果已注册）。"""
+        if self._step_callback:
+            try:
+                self._step_callback(event_type, data)
+            except Exception:
+                logger.warning("step_callback.error", exc_info=True)
 
     async def _extract_last_content(self) -> str:
         """从消息历史中提取最后一条 assistant 消息的内容。"""
