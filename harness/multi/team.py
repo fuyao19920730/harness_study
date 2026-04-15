@@ -147,13 +147,39 @@ class AgentTeam:
         log = logger.bind(team="supervisor", goal=goal[:80])
         log.info("team.run.start", workers=self.worker_names)
 
-        trace = Trace(agent_name=f"team_{self._supervisor.name}", goal=goal)
+        trace = Trace(
+            agent_name=f"team_{self._supervisor.name}",
+            goal=goal,
+        )
         messages: list[AgentMessage] = []
         worker_results: dict[str, AgentResult] = {}
 
-        # 构建增强版的 Supervisor 提示
+        enhanced_goal = self._build_enhanced_goal(goal)
+        delegate_tool = self._make_delegate_tool(
+            messages, worker_results, trace, log,
+        )
+
+        # 把 delegate 工具注册给 Supervisor
+        self._supervisor._tool_registry.register(delegate_tool)
+
+        try:
+            return await self._run_supervisor_and_build_result(
+                enhanced_goal, trace,
+                messages, worker_results, log,
+            )
+        finally:
+            # 清理：移除临时注册的 delegate 工具
+            if "delegate_to_worker" in self._supervisor._tool_registry:
+                del self._supervisor._tool_registry._tools[
+                    "delegate_to_worker"
+                ]
+
+    # ── run() 子方法 ──────────────────────────────────────────
+
+    def _build_enhanced_goal(self, goal: str) -> str:
+        """构建增强版的 Supervisor 提示，附上 Worker 信息和协作指引。"""
         worker_descriptions = self._build_worker_descriptions()
-        enhanced_goal = (
+        return (
             f"{goal}\n\n"
             f"你是团队的 Supervisor，管理以下 Worker Agent：\n"
             f"{worker_descriptions}\n\n"
@@ -162,25 +188,49 @@ class AgentTeam:
             f"收到所有 Worker 的结果后，汇总出最终答案。"
         )
 
-        # 把"委派给 Worker"包装成 Supervisor 的工具
+    def _make_delegate_tool(
+        self,
+        messages: list[AgentMessage],
+        worker_results: dict[str, AgentResult],
+        trace: Trace,
+        log: Any,
+    ) -> Any:
+        """创建委派工具，Supervisor 通过它分派子任务给 Worker。
+
+        返回一个 FunctionTool，内部闭包会捕获 messages / worker_results / trace / log，
+        在被 Supervisor 调用时驱动 Worker 执行并记录结果。
+        """
         from harness.tools.base import FunctionTool
 
-        async def delegate_to_worker(worker_name: str, task: str) -> str:
-            """把子任务分派给指定的 Worker Agent 执行。"""
-            if worker_name not in self._workers:
-                available = ", ".join(self._workers.keys())
-                return f"Error: Worker '{worker_name}' 不存在。可用: {available}"
+        supervisor_name = self._supervisor.name
+        workers = self._workers
+        worker_names_str = ", ".join(workers.keys())
 
-            log.info("team.delegate", worker=worker_name, task=task[:60])
+        async def delegate_to_worker(
+            worker_name: str, task: str,
+        ) -> str:
+            """把子任务分派给指定的 Worker Agent 执行。"""
+            if worker_name not in workers:
+                available = ", ".join(workers.keys())
+                return (
+                    f"Error: Worker '{worker_name}' "
+                    f"不存在。可用: {available}"
+                )
+
+            log.info(
+                "team.delegate",
+                worker=worker_name,
+                task=task[:60],
+            )
             messages.append(AgentMessage(
-                from_agent=self._supervisor.name,
+                from_agent=supervisor_name,
                 to_agent=worker_name,
                 content=task,
                 message_type="task",
             ))
 
             t0 = time.time()
-            worker = self._workers[worker_name]
+            worker = workers[worker_name]
             try:
                 result = await worker.run(task)
                 worker_results[worker_name] = result
@@ -192,12 +242,16 @@ class AgentTeam:
                     input=task,
                     output=result.output[:500],
                     latency_ms=latency_ms,
-                    metadata={"worker_tokens": result.trace.total_tokens},
+                    metadata={
+                        "worker_tokens": (
+                            result.trace.total_tokens
+                        ),
+                    },
                 ))
 
                 messages.append(AgentMessage(
                     from_agent=worker_name,
-                    to_agent=self._supervisor.name,
+                    to_agent=supervisor_name,
                     content=result.output,
                     message_type="result",
                 ))
@@ -211,30 +265,40 @@ class AgentTeam:
                 return result.output
 
             except Exception as e:
-                error_msg = f"Worker '{worker_name}' 执行失败: {type(e).__name__}: {e}"
-                log.error("team.worker.error", worker=worker_name, error=str(e))
+                error_msg = (
+                    f"Worker '{worker_name}' 执行失败: "
+                    f"{type(e).__name__}: {e}"
+                )
+                log.error(
+                    "team.worker.error",
+                    worker=worker_name,
+                    error=str(e),
+                )
                 messages.append(AgentMessage(
                     from_agent=worker_name,
-                    to_agent=self._supervisor.name,
+                    to_agent=supervisor_name,
                     content=error_msg,
                     message_type="result",
                     metadata={"error": True},
                 ))
                 return error_msg
 
-        delegate_tool = FunctionTool(
+        return FunctionTool(
             func=delegate_to_worker,
             name="delegate_to_worker",
             description=(
                 "把子任务分派给指定的 Worker Agent 执行。"
-                f"可用 Worker: {', '.join(self._workers.keys())}"
+                f"可用 Worker: {worker_names_str}"
             ),
             parameters_schema={
                 "type": "object",
                 "properties": {
                     "worker_name": {
                         "type": "string",
-                        "description": f"Worker 名称，可选: {', '.join(self._workers.keys())}",
+                        "description": (
+                            "Worker 名称，可选: "
+                            f"{worker_names_str}"
+                        ),
                     },
                     "task": {
                         "type": "string",
@@ -245,41 +309,43 @@ class AgentTeam:
             },
         )
 
-        # 把 delegate 工具注册给 Supervisor
-        self._supervisor._tool_registry.register(delegate_tool)
+    async def _run_supervisor_and_build_result(
+        self,
+        enhanced_goal: str,
+        trace: Trace,
+        messages: list[AgentMessage],
+        worker_results: dict[str, AgentResult],
+        log: Any,
+    ) -> TeamResult:
+        """运行 Supervisor Agent 并构建最终的 TeamResult。"""
+        t0 = time.time()
+        supervisor_result = await self._supervisor.run(
+            enhanced_goal,
+        )
+        total_latency = (time.time() - t0) * 1000
 
-        try:
-            t0 = time.time()
-            supervisor_result = await self._supervisor.run(enhanced_goal)
-            total_latency = (time.time() - t0) * 1000
+        trace.add_step(TraceStep(
+            type=StepType.LLM_CALL,
+            model="supervisor",
+            latency_ms=total_latency,
+            metadata={"role": "supervisor"},
+        ))
+        trace.finish(output=supervisor_result.output)
 
-            trace.add_step(TraceStep(
-                type=StepType.LLM_CALL,
-                model="supervisor",
-                latency_ms=total_latency,
-                metadata={"role": "supervisor"},
-            ))
-            trace.finish(output=supervisor_result.output)
+        log.info(
+            "team.run.finish",
+            workers_used=len(worker_results),
+            messages=len(messages),
+            latency_ms=round(total_latency),
+        )
 
-            log.info(
-                "team.run.finish",
-                workers_used=len(worker_results),
-                messages=len(messages),
-                latency_ms=round(total_latency),
-            )
-
-            return TeamResult(
-                output=supervisor_result.output,
-                supervisor_result=supervisor_result,
-                worker_results=worker_results,
-                messages=messages,
-                trace=trace,
-            )
-
-        finally:
-            # 清理：移除临时注册的 delegate 工具
-            if "delegate_to_worker" in self._supervisor._tool_registry:
-                del self._supervisor._tool_registry._tools["delegate_to_worker"]
+        return TeamResult(
+            output=supervisor_result.output,
+            supervisor_result=supervisor_result,
+            worker_results=worker_results,
+            messages=messages,
+            trace=trace,
+        )
 
     def _build_worker_descriptions(self) -> str:
         """构建 Worker 描述文本，告诉 Supervisor 每个 Worker 擅长什么。"""
