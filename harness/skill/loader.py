@@ -49,6 +49,7 @@ def make_load_skill_tool(
         name="load_skill",
     )
     def load_skill(name: str) -> str:
+        """按 name 查找并加载 Skill，同时注册其依赖工具。"""
         skill = skill_registry.get(name)
         if not skill:
             available = ", ".join(skill_registry.list_names()) or "（无）"

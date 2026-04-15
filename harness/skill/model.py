@@ -100,7 +100,9 @@ def parse_skill_file(path: Path) -> Skill:
     try:
         meta = yaml.safe_load(match.group(1)) or {}
     except yaml.YAMLError as e:
-        raise ValueError(f"SKILL.md frontmatter YAML 解析失败: {path}\n{e}") from e
+        raise ValueError(
+            f"SKILL.md frontmatter YAML 解析失败: {path}\n{e}"
+        ) from e
 
     if not isinstance(meta, dict):
         raise ValueError(f"SKILL.md frontmatter 应为字典格式: {path}")

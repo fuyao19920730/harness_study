@@ -85,13 +85,21 @@ class SkillRegistry:
                 try:
                     skill = parse_skill_file(skill_file)
                 except (ValueError, FileNotFoundError) as e:
-                    logger.warning("skill.scan.parse_error", path=str(skill_file), error=str(e))
+                    logger.warning(
+                        "skill.scan.parse_error",
+                        path=str(skill_file),
+                        error=str(e),
+                    )
                     continue
 
                 # 高优先级路径先扫描，同名不覆盖
                 if skill.name not in self._skills:
                     self._skills[skill.name] = skill
-                    logger.debug("skill.scan.found", name=skill.name, path=str(skill_file))
+                    logger.debug(
+                        "skill.scan.found",
+                        name=skill.name,
+                        path=str(skill_file),
+                    )
                 else:
                     logger.debug(
                         "skill.scan.duplicate_skipped",
@@ -118,7 +126,11 @@ class SkillRegistry:
             try:
                 skill.load_content()
             except FileNotFoundError:
-                logger.warning("skill.load.file_missing", name=name, path=str(skill.path))
+                logger.warning(
+                    "skill.load.file_missing",
+                    name=name,
+                    path=str(skill.path),
+                )
                 return None
         return skill
 

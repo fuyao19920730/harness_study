@@ -573,19 +573,25 @@ class Agent:
         from harness.tools.builtin import ALL_BUILTIN_TOOLS
 
         # 构建 tool_pool：内置工具 + 用户注册工具
-        tool_pool: dict[str, BaseTool] = {t.name: t for t in ALL_BUILTIN_TOOLS}
+        tool_pool: dict[str, BaseTool] = {
+            t.name: t for t in ALL_BUILTIN_TOOLS
+        }
         for name in self._tool_registry.list_names():
             obj = self._tool_registry.get(name)
             if obj:
                 tool_pool[name] = obj
 
-        registry = SkillRegistry(search_paths=search_paths, tool_pool=tool_pool)
+        registry = SkillRegistry(
+            search_paths=search_paths,
+            tool_pool=tool_pool,
+        )
         count = registry.scan()
 
         if count > 0:
             self._skill_registry = registry
-            # 自动注册 load_skill 工具，让 LLM 可以按需加载 Skill
-            load_tool = make_load_skill_tool(registry, self._tool_registry)
+            load_tool = make_load_skill_tool(
+                registry, self._tool_registry,
+            )
             self._tool_registry.register(load_tool)
 
     @staticmethod
