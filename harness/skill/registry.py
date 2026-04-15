@@ -78,7 +78,10 @@ class SkillRegistry:
 
         for search_dir in self._search_paths:
             if not search_dir.is_dir():
-                logger.debug("skill.scan.skip_missing_dir", path=str(search_dir))
+                logger.debug(
+                    "skill.scan.skip_missing_dir",
+                    path=str(search_dir),
+                )
                 continue
 
             for skill_file in sorted(search_dir.rglob("SKILL.md")):

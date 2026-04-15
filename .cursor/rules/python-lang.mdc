@@ -1,0 +1,109 @@
+---
+description: Python 语言规范（Google 风格指南·语言特性部分，中文）
+alwaysApply: true
+---
+
+# Python 语言规范
+
+## Lint
+
+- 用 pylint / ruff 检查所有代码。抑制不恰当的警告时用行注释 `# pylint: disable=xxx` 或 `# noqa: XXX`，并附说明。
+- 无用参数：在函数体开头 `del unused_arg`，注明"未使用"。
+
+## 导入
+
+- `import` 只导入**包和模块**，不单独导入函数或类（`typing`/`collections.abc` 除外）。
+- `from x import y`：x 是包前缀，y 是模块名。禁止相对导入（同包也用完整路径）。
+- 别名 `import y as z` 仅用于标准缩写（如 `np`）。
+
+## 异常
+
+- 优先使用合适的**内置异常**（`ValueError`/`TypeError`/`KeyError`/`ConnectionError` 等）。
+- 不用 `assert` 验证公开 API 参数；`assert` 仅用于内部不变式。
+- 自定义异常继承已有异常类，名称以 `Error` 结尾，避免冗余前缀（如 `foo.FooError`）。
+- 永远不要裸 `except:` 或捕获 `Exception`，除非重新抛出或做顶层隔离。
+- `try` 块尽量小。用 `finally` 做必须执行的清理。
+
+## 全局变量
+
+- 避免可变全局变量。
+- 模块级**常量**允许且鼓励：`_MAX_RETRIES = 3`（内部）、`DEFAULT_TIMEOUT = 30`（公开）。
+- 若需全局状态，通过公有函数或类方法访问，注释说明设计意图。
+
+## 嵌套函数与类
+
+- 允许用嵌套函数捕获局部变量（闭包），但不要仅为了隐藏函数而嵌套。
+- 纯隐藏用途的函数应提升为模块级 `_private_func()`，方便测试。
+
+## 推导式
+
+- 映射表达式、`for`、过滤各不超一行。禁止多重 `for`。
+- 复杂情况用显式循环。
+
+## 默认迭代器与操作符
+
+- 优先用 `for key in adict:` / `if x in alist:` / `for line in afile:`。
+- 不要 `adict.keys()` / `afile.readlines()`。
+
+## 生成器
+
+- 按需使用。文档字符串用 `Yields:` 而非 `Returns:`。
+- 占用大量资源的生成器要强制清理（上下文管理器）。
+
+## Lambda
+
+- 仅用于单行函数，体不超 60-80 字符。
+- 常见操作用 `operator` 模块（如 `operator.mul`）。
+
+## 条件表达式
+
+- 简单情况可用 `x = a if cond else b`。
+- 真值、`if`、`else` 各不超一行；复杂时用完整 `if` 语句。
+
+## 默认参数值
+
+- 默认值**不能**是可变对象（`list`/`dict`/`set`）。
+- 可变默认用 `None` + 函数体内创建：`def f(items=None): items = items or []`。
+
+## 特性（Properties）
+
+- `@property` 仅用于轻量、直白的计算。不掩盖副作用。
+- 不要用 `@staticmethod`（改写为模块级函数）。`@classmethod` 仅用于具名构造函数或修改进程级共享状态。
+
+## True/False 求值
+
+- 用隐式假值：`if not seq:` 而非 `if len(seq) == 0:`。
+- 检查 `None` 必须用 `is None` / `is not None`，不用 `==`。
+- 不要 `== False`，用 `if not x:`。
+- 整数比较显式与 0 比（`if count == 0:`），避免把 `None` 误当 0。
+
+## 词法作用域
+
+- 嵌套函数可读取外层变量但不能赋值（除非 `nonlocal`）。
+- 注意 `for` 循环变量与闭包的交互（循环变量在闭包中是引用，非快照）。
+
+## 装饰器
+
+- 审慎使用；必须有显著优势。为装饰器编写单元测试。
+- 装饰器不应依赖外部资源（文件、网络、数据库）。
+
+## 线程
+
+- 不依赖内置类型的原子性。
+- 线程间传数据优先用 `queue.Queue`，其次 `threading` 锁原语。
+
+## 威力过大的功能
+
+- 避免元类、字节码操作、动态继承、`__del__` 自定义清理等。
+- 可以使用基于这些功能的标准库：`abc.ABCMeta`、`dataclasses`、`enum`。
+
+## from \_\_future\_\_ imports
+
+- 鼓励使用 `from __future__ import annotations`（本项目已全局启用）。
+- 不要删除已有的 future 语句。
+
+## 类型注解
+
+- 添加或修改公开 API 时必须加类型注解。
+- 用 PEP 585 内置泛型：`list[str]`、`dict[str, int]`（不用 `typing.List`）。
+- 并集用 `X | None`（不用 `Optional[X]`）。
