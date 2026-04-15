@@ -11,6 +11,7 @@ from harness.safety.confirm import TrustedCommandPolicy, cli_confirm_handler
 from harness.safety.guards import BudgetGuard, InputGuard, OutputGuard, ToolGuard
 from harness.scheduler.dag import DAGScheduler
 from harness.schema.message import Message
+from harness.skill import Skill, SkillRegistry, make_load_skill_tool
 from harness.tools.base import tool
 
 __all__ = [
@@ -32,4 +33,7 @@ __all__ = [
     "InMemoryLongTermMemory",
     "AgentTeam",
     "DAGScheduler",
+    "Skill",
+    "SkillRegistry",
+    "make_load_skill_tool",
 ]

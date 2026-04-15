@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -48,6 +49,8 @@ from harness.safety.guards import (
 from harness.schema.config import AgentConfig, LLMConfig, MemoryConfig, SafetyConfig
 from harness.schema.message import Message, Role, ToolResult
 from harness.schema.trace import StepType, Trace, TraceStep
+from harness.skill.loader import make_load_skill_tool
+from harness.skill.registry import SkillRegistry
 from harness.tools.base import BaseTool
 from harness.tools.registry import ToolRegistry
 
@@ -116,6 +119,10 @@ class Agent:
         # 日志级别：传入后自动调用 setup_logging 配置全局日志
         # 常用值："error"（静默，适合 CLI 应用）/ "info"（默认）/ "debug"（详细）
         log_level: str | None = None,
+        # Skill 搜索路径列表（按优先级从高到低）。
+        # 不传则使用默认搜索路径：项目 .skills/ → 用户 ~/.harness/skills/ → 框架内置
+        # 传空列表 [] 表示禁用 Skill 系统
+        skill_dirs: list[str | Path] | None = None,
     ) -> None:
         # ── 日志配置 ──
         if log_level:
@@ -151,6 +158,18 @@ class Agent:
         if tools:
             for t in tools:
                 self._tool_registry.register(t)
+
+        # ── Skill 系统 ──
+        self._skill_registry: SkillRegistry | None = None
+        if skill_dirs is not None:
+            # 用户显式传入路径：空列表 = 禁用，非空 = 自定义搜索路径
+            if skill_dirs:
+                paths = [Path(p) for p in skill_dirs]
+                self._init_skills(paths)
+        else:
+            # 未传参：使用默认搜索路径（项目级 + 用户级 + 框架内置）
+            default_paths = self._default_skill_paths()
+            self._init_skills(default_paths)
 
         # ── 初始化 LLM（带重试） ──
         raw_llm = llm or self._build_llm(self._config.llm)
@@ -258,6 +277,13 @@ class Agent:
             system_prompt = (
                 self._config.system_prompt or self._default_system_prompt()
             )
+
+            # 注入 Skill 索引（如有可用 Skill）
+            if self._skill_registry:
+                skill_section = self._skill_registry.build_prompt_section()
+                if skill_section:
+                    system_prompt += "\n\n" + skill_section
+
             if self._tool_registry.list_names():
                 system_prompt = self._planner.build_system_prompt(
                     system_prompt, self._tool_registry.list_names()
@@ -266,10 +292,11 @@ class Agent:
             await self._memory.add(Message.system(system_prompt))
             await self._memory.add(Message.user(goal))
 
-        tool_schemas = self._tool_registry.list_schemas() or None
-
         # ── 主循环 ──
         for step_idx in range(self._config.safety.max_steps):
+            # 每轮刷新 tool_schemas，确保 load_skill 动态注册的工具能被 LLM 感知
+            tool_schemas = self._tool_registry.list_schemas() or None
+
             # 预算检查
             budget_check = self._budget_guard.check()
             if budget_check.blocked:
@@ -534,6 +561,45 @@ class Agent:
                 self._trace_exporter.export_json(trace)
             except Exception:
                 logger.warning("trace.export.failed", exc_info=True)
+
+    def _init_skills(self, search_paths: list[Path]) -> None:
+        """初始化 Skill 系统：创建 SkillRegistry、扫描目录、注册 load_skill 工具。
+
+        只有在扫描到至少一个 Skill 时，才注册 load_skill 工具并保留 registry。
+
+        Args:
+            search_paths: Skill 搜索路径列表（按优先级从高到低排列）。
+        """
+        from harness.tools.builtin import ALL_BUILTIN_TOOLS
+
+        # 构建 tool_pool：内置工具 + 用户注册工具
+        tool_pool: dict[str, BaseTool] = {t.name: t for t in ALL_BUILTIN_TOOLS}
+        for name in self._tool_registry.list_names():
+            obj = self._tool_registry.get(name)
+            if obj:
+                tool_pool[name] = obj
+
+        registry = SkillRegistry(search_paths=search_paths, tool_pool=tool_pool)
+        count = registry.scan()
+
+        if count > 0:
+            self._skill_registry = registry
+            # 自动注册 load_skill 工具，让 LLM 可以按需加载 Skill
+            load_tool = make_load_skill_tool(registry, self._tool_registry)
+            self._tool_registry.register(load_tool)
+
+    @staticmethod
+    def _default_skill_paths() -> list[Path]:
+        """返回默认的 Skill 搜索路径（按优先级从高到低）。
+
+        1. 项目级：当前工作目录下的 .skills/
+        2. 用户级：~/.harness/skills/
+        （框架内置路径由 SkillRegistry 自动追加，无需在此列出）
+        """
+        return [
+            Path.cwd() / ".skills",
+            Path.home() / ".harness" / "skills",
+        ]
 
     @staticmethod
     def _build_llm(llm_config: LLMConfig) -> BaseLLM:

@@ -171,7 +171,7 @@ def cli_confirm_handler(
 
         # 信任列表自动放行
         if policy and command and policy.is_trusted(command):
-            print(f"\033[2m  \U0001f513 shell 命令已在信任列表中，自动放行\033[0m")
+            print("\033[2m  \U0001f513 shell 命令已在信任列表中，自动放行\033[0m")
             return True
 
         # 交互式确认
