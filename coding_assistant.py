@@ -7,34 +7,26 @@
     /exit, /quit  — 退出
     /clear        — 清空对话历史
     /cost         — 查看本轮 token 消耗
+    /trust        — 管理信任命令列表
     /help         — 显示帮助
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
-import os
 import sys
 from pathlib import Path
 
-import structlog
-
-# 在导入 harness 之前，重新配置 structlog：静音所有 INFO/DEBUG 输出
-# Agent 的运行过程通过 step_callback 展示，不再需要 structlog 日志
-structlog.configure(
-    wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
-)
-logging.basicConfig(level=logging.ERROR, force=True)
-
-from harness.agent import Agent, AgentResult  # noqa: E402
-from harness.llm.openai import OpenAILLM  # noqa: E402
-from harness.safety.guards import BudgetGuard, ToolGuard  # noqa: E402
-from harness.schema.config import SafetyConfig  # noqa: E402
-from harness.tools.builtin.code_tools import edit_file, search_code  # noqa: E402
-from harness.tools.builtin.file_ops import list_dir, read_file, write_file  # noqa: E402
-from harness.tools.builtin.shell import shell  # noqa: E402
+from harness.agent import Agent
+from harness.config import resolve_api_key
+from harness.llm.openai import OpenAILLM
+from harness.observability.renderer import ConsoleStepRenderer
+from harness.safety.confirm import TrustedCommandPolicy, cli_confirm_handler
+from harness.safety.guards import BudgetGuard, ToolGuard
+from harness.schema.config import LLMConfig, SafetyConfig
+from harness.tools.builtin.code_tools import edit_file, search_code
+from harness.tools.builtin.file_ops import list_dir, read_file, write_file
+from harness.tools.builtin.shell import shell
 
 # ── 项目路径 ──────────────────────────────────────────────────
 
@@ -114,7 +106,7 @@ def _get_project_tree() -> str:
 
 BANNER = """\
 ╔══════════════════════════════════════════════╗
-║        Harness 编码助手 v0.1                 ║
+║        Harness 编码助手 v0.2                 ║
 ║  输入问题或指令，我来帮你读代码、改代码、跑命令  ║
 ║  /help 查看命令  /exit 退出                   ║
 ╚══════════════════════════════════════════════╝
@@ -145,73 +137,23 @@ Shell 确认机制：
 """
 
 
-# ── 默认信任命令 ──────────────────────────────────────────────
-
-DEFAULT_TRUSTED_COMMANDS: list[str] = [
-    "python",
-    "pytest",
-    "git status",
-    "git diff",
-    "git log",
-    "git branch",
-    "ls",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "find",
-    "grep",
-    "rg",
-    "echo",
-    "pwd",
-    "which",
-    "pip list",
-    "pip show",
-    "ruff",
-]
-
-
-TRUST_CACHE_FILE = PROJECT_DIR / ".coding_assistant.json"
-
-
-def _load_user_trusted_commands() -> list[str]:
-    """从缓存文件加载用户自定义的信任命令。"""
-    if not TRUST_CACHE_FILE.exists():
-        return []
-    try:
-        data = json.loads(TRUST_CACHE_FILE.read_text(encoding="utf-8"))
-        return data.get("trusted_commands", [])
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def _save_user_trusted_commands(commands: list[str]) -> None:
-    """将用户自定义的信任命令写入缓存文件。"""
-    try:
-        data = {"trusted_commands": sorted(set(commands))}
-        TRUST_CACHE_FILE.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-
-
 class CodingAssistantCLI:
     """编码助手的命令行界面。"""
 
     def __init__(self) -> None:
         self._agent: Agent | None = None
-        self._total_prompt_tokens = 0
-        self._total_completion_tokens = 0
-        self._turn_count = 0
-        # 信任命令 = 内置默认 + 用户自定义（从文件加载）
-        self._user_trusted: list[str] = _load_user_trusted_commands()
-        self._trusted_commands: list[str] = list(DEFAULT_TRUSTED_COMMANDS) + self._user_trusted
+        self._policy = TrustedCommandPolicy(
+            cache_file=PROJECT_DIR / ".coding_assistant.json",
+        )
 
     async def start(self) -> None:
-        """启动 CLI 交互循环。"""
-        api_key = self._resolve_api_key()
+        """启动 CLI 交互循环。
+
+        初始化顺序：解析 API Key → 构建 LLM → 配置安全策略 → 组装 Agent → 进入 REPL。
+        """
+        # 通过框架的 resolve_api_key 统一解析（环境变量 > .env 文件）
+        llm_config = LLMConfig(provider="deepseek", model="deepseek-chat")
+        api_key = resolve_api_key(llm_config, env_file=PROJECT_DIR / ".env")
         if not api_key:
             print("Error: 未找到 DEEPSEEK_API_KEY。")
             print("请设置环境变量或在 .env 文件中配置。")
@@ -225,6 +167,7 @@ class CodingAssistantCLI:
             timeout=120.0,
         )
 
+        # shell 工具需要人工确认（信任列表中的自动放行）
         safety_cfg = SafetyConfig(
             max_steps=25,
             require_confirmation=["shell"],
@@ -240,8 +183,9 @@ class CodingAssistantCLI:
             tool_guard=ToolGuard(safety_config=safety_cfg),
             budget_guard=BudgetGuard(max_tokens=200_000),
             max_retries=2,
-            confirm_callback=self._confirm_tool,
-            step_callback=self._on_agent_step,
+            confirm_callback=cli_confirm_handler(self._policy),  # 框架内置 CLI 确认器
+            step_callback=ConsoleStepRenderer(),                 # 框架内置步骤渲染器
+            log_level="error",                                   # 静默框架日志，靠渲染器展示进度
         )
 
         print(BANNER)
@@ -268,7 +212,6 @@ class CodingAssistantCLI:
                         break
                     continue
 
-                self._turn_count += 1
                 print("\033[2m思考中...\033[0m")
 
                 try:
@@ -277,8 +220,6 @@ class CodingAssistantCLI:
                         keep_history=not first_turn,
                     )
                     first_turn = False
-
-                    self._track_tokens(result)
                     print(f"\n\033[1;34m助手>\033[0m {result.output}\n")
 
                 except KeyboardInterrupt:
@@ -302,21 +243,22 @@ class CodingAssistantCLI:
         if cmd_lower == "/clear":
             assert self._agent is not None
             await self._agent.reset_conversation()
-            self._total_prompt_tokens = 0
-            self._total_completion_tokens = 0
-            self._turn_count = 0
             print("\033[33m[已清空对话历史]\033[0m\n")
             return True
 
         if cmd_lower == "/cost":
-            total = self._total_prompt_tokens + self._total_completion_tokens
-            cost = (self._total_prompt_tokens * 0.14 + self._total_completion_tokens * 0.28) / 1_000_000
+            assert self._agent is not None
+            usage = self._agent.session_usage
+            total = usage["total_tokens"]
+            prompt = usage["prompt_tokens"]
+            comp = usage["completion_tokens"]
+            cost_rmb = (prompt * 0.14 + comp * 0.28) / 1_000_000
             print(f"\033[36m"
-                  f"  对话轮数: {self._turn_count}\n"
-                  f"  输入 token: {self._total_prompt_tokens:,}\n"
-                  f"  输出 token: {self._total_completion_tokens:,}\n"
+                  f"  对话轮数: {usage['turns']}\n"
+                  f"  输入 token: {prompt:,}\n"
+                  f"  输出 token: {comp:,}\n"
                   f"  合计 token: {total:,}\n"
-                  f"  估算费用: ￥{cost:.4f} (DeepSeek)\n"
+                  f"  估算费用: ￥{cost_rmb:.4f} (DeepSeek)\n"
                   f"\033[0m")
             return True
 
@@ -336,18 +278,19 @@ class CodingAssistantCLI:
         parts = cmd.split(maxsplit=2)
 
         if len(parts) == 1:
-            # /trust — 查看列表
-            builtin_set = set(DEFAULT_TRUSTED_COMMANDS)
+            builtin_set = self._policy.default_set
+            all_cmds = self._policy.list_all()
+            user_cmds = self._policy.list_user()
             print("\033[36m信任命令列表（以下前缀的 shell 命令自动放行）:\033[0m")
-            for i, t in enumerate(sorted(self._trusted_commands), 1):
+            for i, t in enumerate(sorted(all_cmds), 1):
                 tag = "" if t in builtin_set else " \033[33m[自定义]\033[36m"
                 print(f"\033[36m  {i:2}. {t}{tag}\033[0m")
-            user_count = len(self._user_trusted)
-            print(f"\033[2m\n  共 {len(self._trusted_commands)} 条"
-                  f"（内置 {len(self._trusted_commands) - user_count}，"
-                  f"自定义 {user_count}）\033[0m")
-            if TRUST_CACHE_FILE.exists():
-                print(f"\033[2m  缓存文件: {TRUST_CACHE_FILE}\033[0m")
+            print(f"\033[2m\n  共 {len(all_cmds)} 条"
+                  f"（内置 {len(all_cmds) - len(user_cmds)}，"
+                  f"自定义 {len(user_cmds)}）\033[0m")
+            cache = PROJECT_DIR / ".coding_assistant.json"
+            if cache.exists():
+                print(f"\033[2m  缓存文件: {cache}\033[0m")
             print(f"\033[2m  用 /trust add <cmd> 添加，/trust remove <cmd> 移除\033[0m\n")
             return
 
@@ -359,156 +302,21 @@ class CodingAssistantCLI:
         target = parts[2].strip()
 
         if action == "add":
-            if target in self._trusted_commands:
+            if target in self._policy.list_all():
                 print(f"\033[33m'{target}' 已在信任列表中\033[0m\n")
             else:
-                self._add_trusted(target)
-                print(f"\033[32m✓ 已将 '{target}' 加入信任列表（已保存）\033[0m\n")
+                self._policy.add(target)
+                print(f"\033[32m\u2713 已将 '{target}' 加入信任列表（已保存）\033[0m\n")
 
         elif action in ("remove", "rm", "del"):
-            if target in self._trusted_commands:
-                self._remove_trusted(target)
-                print(f"\033[32m✓ 已将 '{target}' 从信任列表中移除（已保存）\033[0m\n")
+            if target in self._policy.list_all():
+                self._policy.remove(target)
+                print(f"\033[32m\u2713 已将 '{target}' 从信任列表中移除（已保存）\033[0m\n")
             else:
                 print(f"\033[33m'{target}' 不在信任列表中\033[0m\n")
 
         else:
             print(f"\033[33m未知操作: {action}。用 add 或 remove\033[0m\n")
-
-    @staticmethod
-    def _on_agent_step(event_type: str, data: dict) -> None:
-        """实时展示 Agent 每一步的动作。"""
-        if event_type == "thinking":
-            content = data.get("content", "")
-            if content.strip():
-                print(f"\033[2;3m  💭 {content[:200]}\033[0m")
-
-        elif event_type == "tool_call":
-            name = data.get("name", "?")
-            args = data.get("arguments", {})
-            print(f"\n\033[1;36m  🔧 调用工具: {name}\033[0m")
-            for k, v in args.items():
-                display = str(v)
-                if len(display) > 120:
-                    display = display[:120] + "..."
-                print(f"\033[36m     {k}: {display}\033[0m")
-
-        elif event_type == "tool_result":
-            name = data.get("name", "?")
-            content = data.get("content", "")
-            is_error = data.get("is_error", False)
-
-            if is_error:
-                print(f"\033[31m  ❌ {name} 返回错误: {content[:150]}\033[0m")
-            else:
-                preview = content.strip()
-                lines = preview.split("\n")
-                if len(lines) > 8:
-                    preview = "\n".join(lines[:8]) + f"\n     ... (共 {len(lines)} 行)"
-                elif len(preview) > 300:
-                    preview = preview[:300] + "..."
-                print(f"\033[32m  ✅ {name} 返回:\033[0m")
-                for line in preview.split("\n"):
-                    print(f"\033[2m     {line}\033[0m")
-
-        print()
-
-    def _confirm_tool(self, tool_name: str, arguments: dict) -> bool:
-        """shell 等高危工具执行前，先查信任列表，不在列表中才提示用户。"""
-        command = arguments.get("command", "")
-
-        # 检查是否匹配信任命令列表
-        if command and self._is_trusted_command(command):
-            print(f"\033[2m  🔓 shell 命令已在信任列表中，自动放行\033[0m")
-            return True
-
-        # 不在信任列表中，提示用户确认
-        print(f"\n\033[1;33m[需要确认] 工具: {tool_name}\033[0m")
-        for k, v in arguments.items():
-            display_val = str(v)
-            if len(display_val) > 200:
-                display_val = display_val[:200] + "..."
-            print(f"  {k}: {display_val}")
-        try:
-            answer = input(
-                "\033[1;33m执行? (y=是 / n=否 / a=总是信任此类命令): \033[0m"
-            ).strip().lower()
-
-            if answer in ("a", "always"):
-                prefix = self._extract_command_prefix(command)
-                if prefix:
-                    self._add_trusted(prefix)
-                    print(f"\033[32m  ✓ 已将 '{prefix}' 加入信任列表（已保存）\033[0m\n")
-                return True
-
-            return answer in ("y", "yes", "")
-        except (EOFError, KeyboardInterrupt):
-            return False
-
-    def _add_trusted(self, cmd: str) -> None:
-        """添加信任命令并持久化。"""
-        if cmd not in self._trusted_commands:
-            self._trusted_commands.append(cmd)
-        if cmd not in self._user_trusted:
-            self._user_trusted.append(cmd)
-            _save_user_trusted_commands(self._user_trusted)
-
-    def _remove_trusted(self, cmd: str) -> None:
-        """移除信任命令并持久化。"""
-        if cmd in self._trusted_commands:
-            self._trusted_commands.remove(cmd)
-        if cmd in self._user_trusted:
-            self._user_trusted.remove(cmd)
-            _save_user_trusted_commands(self._user_trusted)
-
-    def _is_trusted_command(self, command: str) -> bool:
-        """检查 shell 命令是否匹配信任列表。"""
-        # 处理 "cd xxx && actual_command" 的情况，取最后一个命令判断
-        parts = command.split("&&")
-        cmd = parts[-1].strip() if parts else command.strip()
-
-        # 也处理管道：取第一个命令
-        pipe_parts = cmd.split("|")
-        cmd = pipe_parts[0].strip()
-
-        for trusted in self._trusted_commands:
-            if cmd == trusted or cmd.startswith(trusted + " "):
-                return True
-        return False
-
-    @staticmethod
-    def _extract_command_prefix(command: str) -> str:
-        """从完整命令中提取可信任的前缀（第一个单词/程序名）。"""
-        parts = command.split("&&")
-        cmd = parts[-1].strip() if parts else command.strip()
-        pipe_parts = cmd.split("|")
-        cmd = pipe_parts[0].strip()
-        # 取第一个单词作为命令前缀
-        tokens = cmd.split()
-        return tokens[0] if tokens else ""
-
-    def _track_tokens(self, result: AgentResult) -> None:
-        """从 trace 中累加 token 消耗。"""
-        for step in result.trace.steps:
-            if step.prompt_tokens:
-                self._total_prompt_tokens += step.prompt_tokens
-            if step.completion_tokens:
-                self._total_completion_tokens += step.completion_tokens
-
-    @staticmethod
-    def _resolve_api_key() -> str | None:
-        """从环境变量或 .env 文件读取 API Key。"""
-        key = os.environ.get("DEEPSEEK_API_KEY")
-        if key:
-            return key
-
-        env_file = PROJECT_DIR / ".env"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if line.startswith("DEEPSEEK_API_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        return None
 
 
 # ── 入口 ──────────────────────────────────────────────────────

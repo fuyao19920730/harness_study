@@ -111,8 +111,20 @@ class Agent:
         #   "thinking" — LLM 返回了文本思考（data: content）
         #   "tool_call" — LLM 决定调用工具（data: name, arguments）
         #   "tool_result" — 工具返回了结果（data: name, content, is_error）
+        # 框架提供 ConsoleStepRenderer 作为开箱即用实现
         step_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        # 日志级别：传入后自动调用 setup_logging 配置全局日志
+        # 常用值："error"（静默，适合 CLI 应用）/ "info"（默认）/ "debug"（详细）
+        log_level: str | None = None,
     ) -> None:
+        # ── 日志配置 ──
+        if log_level:
+            from harness.observability.logging import setup_logging
+            setup_logging(
+                level=log_level,
+                quiet=log_level.upper() == "ERROR",
+            )
+
         # ── 构建配置 ──
         if config:
             self._config = config
@@ -170,6 +182,12 @@ class Agent:
         self._confirm_callback = confirm_callback
         self._step_callback = step_callback
 
+        # ── 会话级累计用量（跨 run() 不重置，reset_conversation 时才清零） ──
+        self._session_prompt_tokens: int = 0
+        self._session_completion_tokens: int = 0
+        self._session_cost_usd: float = 0.0
+        self._session_turns: int = 0
+
         # ── Trace 导出（Phase 3） ──
         self._trace_exporter: TraceExporter | None = (
             TraceExporter(output_dir=trace_dir) if trace_dir else None
@@ -178,6 +196,17 @@ class Agent:
     @property
     def name(self) -> str:
         return self._config.name
+
+    @property
+    def session_usage(self) -> dict[str, Any]:
+        """返回当前会话的累计 token 用量和估算费用（跨多轮 run）。"""
+        return {
+            "prompt_tokens": self._session_prompt_tokens,
+            "completion_tokens": self._session_completion_tokens,
+            "total_tokens": self._session_prompt_tokens + self._session_completion_tokens,
+            "estimated_cost_usd": round(self._session_cost_usd, 6),
+            "turns": self._session_turns,
+        }
 
     # ── 核心执行循环 ──────────────────────────────────────────
 
@@ -199,6 +228,7 @@ class Agent:
         self._planner.reset()
         self._working.clear()
         self._budget_guard.reset()
+        self._session_turns += 1
 
         trace = Trace(agent_name=self.name, goal=goal)
 
@@ -262,13 +292,18 @@ class Agent:
             response = await self._llm.chat(messages, tools=tool_schemas)
             latency_ms = (time.time() - t0) * 1000
 
-            # 记录 token 消耗到 budget
+            # 记录 token 消耗到 budget + 会话级累计
             prompt_tok = response.usage.prompt_tokens if response.usage else 0
             comp_tok = response.usage.completion_tokens if response.usage else 0
             self._budget_guard.record_llm_call(
                 prompt_tokens=prompt_tok,
                 completion_tokens=comp_tok,
                 model=response.model,
+            )
+            self._session_prompt_tokens += prompt_tok
+            self._session_completion_tokens += comp_tok
+            self._session_cost_usd += BudgetGuard._estimate_cost(
+                prompt_tok, comp_tok, response.model,
             )
 
             trace.add_step(TraceStep(
@@ -345,9 +380,13 @@ class Agent:
         return result.output
 
     async def reset_conversation(self) -> None:
-        """清空对话历史，开始新的会话。"""
+        """清空对话历史和会话用量统计，开始新的会话。"""
         await self._memory.clear()
         self._working.clear()
+        self._session_prompt_tokens = 0
+        self._session_completion_tokens = 0
+        self._session_cost_usd = 0.0
+        self._session_turns = 0
 
     async def close(self) -> None:
         """释放资源（HTTP 连接池等）。"""

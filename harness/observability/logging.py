@@ -13,6 +13,9 @@
 
     # 生产环境（JSON 输出）
     setup_logging(level="INFO", json_format=True)
+
+    # 静默模式（只输出 ERROR，适合有自定义 step_callback 的 CLI 应用）
+    setup_logging(quiet=True)
 """
 
 from __future__ import annotations
@@ -26,13 +29,30 @@ import structlog
 def setup_logging(
     level: str = "INFO",
     json_format: bool = False,
+    quiet: bool = False,
 ) -> None:
     """配置 structlog 结构化日志。
 
     参数：
         level:       日志级别（DEBUG / INFO / WARNING / ERROR）
         json_format: True=JSON 输出（生产环境），False=彩色输出（开发环境）
+        quiet:       静默模式，压制到 ERROR 级别。适合应用层通过
+                     step_callback 自行展示进度、不需要框架日志噪音的场景。
     """
+    if quiet:
+        level = "ERROR"
+
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    if quiet:
+        # 静默模式：用 filtering_bound_logger 直接在 structlog 层面过滤，
+        # 同时压低标准库 logging，避免第三方库的 INFO/DEBUG 输出
+        structlog.configure(
+            wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        )
+        logging.basicConfig(level=log_level, force=True)
+        return
+
     # 共享的日志处理链
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,    # 合并上下文变量（如 trace_id）
@@ -79,4 +99,4 @@ def setup_logging(
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
-    root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root_logger.setLevel(log_level)
